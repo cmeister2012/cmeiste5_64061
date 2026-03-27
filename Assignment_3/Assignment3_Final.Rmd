@@ -1,0 +1,425 @@
+---
+title: "Assignment 3: Time-Series Forecasting"
+author: "Curtis Meister"
+date: "March 30, 2026"
+output:
+  pdf_document:
+    latex_engine: xelatex
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(keras.fit_verbose = 0)
+```
+
+```{r}
+library(tidyverse)
+library(keras)
+library(tensorflow)
+library(reticulate)
+```
+
+```{r}
+set.seed(123)
+tf$random$set_seed(as.integer(123))
+```
+
+```{r}
+zip_path <- get_file(
+  fname = "jena_climate_2009_2016.csv.zip",
+  origin = "https://storage.googleapis.com/tensorflow/tf-keras-datasets/jena_climate_2009_2016.csv.zip",
+  extract = TRUE
+)
+
+csv_path <- file.path(dirname(zip_path), "jena_climate_2009_2016.csv")
+weather_data <- read.csv(csv_path)
+
+glimpse(weather_data)
+dim(weather_data)
+head(weather_data)
+```
+
+```{r}
+ggplot(weather_data[1:5000, ], aes(x = 1:5000, y = T..degC.)) +
+  geom_line() +
+  theme_minimal() +
+  labs(
+    title = "Temperature Over Time (First 5,000 Observations)",
+    x = "Time Step",
+    y = "Temperature (°C)"
+  )
+```
+
+```{r}
+sampling_rate <- as.integer(6)
+sequence_length <- as.integer(120)
+delay <- as.integer(144)
+batch_size <- as.integer(256)
+
+n <- nrow(weather_data)
+
+train_end <- as.integer(round(0.5 * n))
+val_end   <- as.integer(round(0.75 * n))
+
+train_data <- weather_data[1:train_end, ]
+val_data   <- weather_data[(train_end + 1):val_end, ]
+test_data  <- weather_data[(val_end + 1):n, ]
+```
+
+```{r}
+train_matrix <- as.matrix(train_data[, -1])
+val_matrix   <- as.matrix(val_data[, -1])
+test_matrix  <- as.matrix(test_data[, -1])
+
+train_mean <- colMeans(train_matrix)
+train_sd   <- apply(train_matrix, 2, sd)
+
+train_matrix <- scale(train_matrix, center = train_mean, scale = train_sd)
+val_matrix   <- scale(val_matrix, center = train_mean, scale = train_sd)
+test_matrix  <- scale(test_matrix, center = train_mean, scale = train_sd)
+
+target_col_index <- which(colnames(weather_data[, -1]) == "T..degC.")
+target_col_index <- as.integer(target_col_index)
+```
+
+```{r}
+make_dataset <- function(data_matrix, targets, sequence_length, delay,
+                         sampling_rate = 6L, batch_size = 256L, shuffle = FALSE) {
+  timeseries_dataset_from_array(
+    data = data_matrix,
+    targets = targets[(sequence_length + delay):length(targets)],
+    sequence_length = as.integer(sequence_length),
+    sampling_rate = as.integer(sampling_rate),
+    batch_size = as.integer(batch_size),
+    shuffle = shuffle,
+    start_index = as.integer(0),
+    end_index = as.integer(nrow(data_matrix) - delay - 1)
+  )
+}
+```
+
+```{r}
+train_ds <- make_dataset(
+  data_matrix = train_matrix,
+  targets = train_data$T..degC.,
+  sequence_length = sequence_length,
+  delay = delay,
+  sampling_rate = sampling_rate,
+  batch_size = batch_size,
+  shuffle = TRUE
+)
+
+val_ds <- make_dataset(
+  data_matrix = val_matrix,
+  targets = val_data$T..degC.,
+  sequence_length = sequence_length,
+  delay = delay,
+  sampling_rate = sampling_rate,
+  batch_size = batch_size,
+  shuffle = FALSE
+)
+
+test_ds <- make_dataset(
+  data_matrix = test_matrix,
+  targets = test_data$T..degC.,
+  sequence_length = sequence_length,
+  delay = delay,
+  sampling_rate = sampling_rate,
+  batch_size = batch_size,
+  shuffle = FALSE
+)
+```
+
+```{r}
+evaluate_naive <- function(dataset) {
+  maes <- c()
+  it <- reticulate::as_iterator(dataset)
+
+  repeat {
+    batch <- tryCatch(
+      reticulate::iter_next(it),
+      error = function(e) NULL
+    )
+    if (is.null(batch)) break
+    inputs  <- batch[[1]]
+    targets <- batch[[2]]
+    preds  <- as.numeric(inputs[, dim(inputs)[2], target_col_index])
+    actual <- as.numeric(targets)
+    maes <- c(maes, mean(abs(preds - actual)))
+  }
+  mean(maes)
+}
+
+naive_mae <- evaluate_naive(val_ds)
+naive_mae
+```
+
+```{r}
+fit_model <- function(model, train_ds, val_ds, epochs = 10) {
+  history <- model %>% fit(
+    train_ds,
+    epochs = as.integer(epochs),
+    validation_data = val_ds,
+    verbose = 0
+  )
+
+  metric_name <- if ("val_mae" %in% names(history$metrics)) {
+    "val_mae"
+  } else if ("val_mean_absolute_error" %in% names(history$metrics)) {
+    "val_mean_absolute_error"
+  } else {
+    stop("Validation MAE metric not found in history$metrics")
+  }
+
+  tail(history$metrics[[metric_name]], 1)
+}
+```
+
+```{r, results='hide'}
+dense_model <- keras_model_sequential() %>%
+  layer_flatten(input_shape = c(sequence_length, ncol(train_matrix))) %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 1)
+
+dense_model %>% compile(
+  optimizer = optimizer_rmsprop(),
+  loss = "mse",
+  metrics = list("mae")
+)
+
+dense_mae <- fit_model(dense_model, train_ds, val_ds)
+```
+```{r}
+dense_mae
+```
+
+```{r, results='hide'}
+lstm_model <- keras_model_sequential() %>%
+  layer_lstm(
+    units = 32,
+    recurrent_dropout = 0.25,
+    input_shape = c(sequence_length, ncol(train_matrix))
+  ) %>%
+  layer_dense(units = 1)
+
+lstm_model %>% compile(
+  optimizer = optimizer_rmsprop(),
+  loss = "mse",
+  metrics = list("mae")
+)
+
+lstm_mae <- fit_model(lstm_model, train_ds, val_ds)
+```
+```{r}
+lstm_mae
+```
+
+```{r, results='hide'}
+gru_model <- keras_model_sequential() %>%
+  layer_gru(
+    units = 32,
+    recurrent_dropout = 0.25,
+    input_shape = c(sequence_length, ncol(train_matrix))
+  ) %>%
+  layer_dense(units = 1)
+
+gru_model %>% compile(
+  optimizer = optimizer_rmsprop(),
+  loss = "mse",
+  metrics = list("mae")
+)
+
+gru_mae <- fit_model(gru_model, train_ds, val_ds)
+```
+```{r}
+gru_mae
+```
+
+```{r, results='hide'}
+stacked_gru <- keras_model_sequential() %>%
+  layer_gru(
+    units = 32,
+    return_sequences = TRUE,
+    recurrent_dropout = 0.25,
+    input_shape = c(sequence_length, ncol(train_matrix))
+  ) %>%
+  layer_gru(
+    units = 32,
+    recurrent_dropout = 0.25
+  ) %>%
+  layer_dense(units = 1)
+
+stacked_gru %>% compile(
+  optimizer = optimizer_rmsprop(),
+  loss = "mse",
+  metrics = list("mae")
+)
+
+stacked_mae <- fit_model(stacked_gru, train_ds, val_ds)
+```
+```{r}
+stacked_mae
+```
+
+```{r, results='hide'}
+conv_gru <- keras_model_sequential() %>%
+  layer_conv_1d(
+    filters = 32,
+    kernel_size = 5,
+    activation = "relu",
+    input_shape = c(sequence_length, ncol(train_matrix))
+  ) %>%
+  layer_max_pooling_1d(pool_size = 3) %>%
+  layer_gru(units = 32) %>%
+  layer_dense(units = 1)
+
+conv_gru %>% compile(
+  optimizer = optimizer_rmsprop(),
+  loss = "mse",
+  metrics = list("mae")
+)
+
+conv_mae <- fit_model(conv_gru, train_ds, val_ds)
+```
+```{r}
+conv_mae
+```
+
+Now I am going to test GRU and Conv1D+GRU across unit sizes of 16, 32, 64, and 128. This will help determine how number of units effects performance.
+
+```{r, results='hide'}
+unit_sizes <- c(16, 32, 64, 128)
+
+gru_unit_results <- map_dfr(unit_sizes, function(units) {
+  model <- keras_model_sequential() %>%
+    layer_gru(
+      units = units,
+      recurrent_dropout = 0.25,
+      input_shape = c(sequence_length, ncol(train_matrix))
+    ) %>%
+    layer_dense(units = 1)
+
+  model %>% compile(
+    optimizer = optimizer_rmsprop(),
+    loss = "mse",
+    metrics = list("mae")
+  )
+
+  val_mae <- fit_model(model, train_ds, val_ds, epochs = 5)
+  tibble(Model = paste0("GRU (", units, " units)"), MAE = val_mae)
+})
+```
+```{r}
+gru_unit_results
+```
+
+```{r, results='hide'}
+conv_gru_unit_results <- map_dfr(unit_sizes, function(units) {
+  model <- keras_model_sequential() %>%
+    layer_conv_1d(
+      filters = units,
+      kernel_size = 5,
+      activation = "relu",
+      input_shape = c(sequence_length, ncol(train_matrix))
+    ) %>%
+    layer_max_pooling_1d(pool_size = 3) %>%
+    layer_gru(units = units) %>%
+    layer_dense(units = 1)
+
+  model %>% compile(
+    optimizer = optimizer_rmsprop(),
+    loss = "mse",
+    metrics = list("mae")
+  )
+
+  val_mae <- fit_model(model, train_ds, val_ds, epochs = 5)
+  tibble(Model = paste0("Conv1D+GRU (", units, " units)"), MAE = val_mae)
+})
+```
+```{r}
+conv_gru_unit_results
+```
+
+## Summary of All Results
+
+```{r}
+results <- bind_rows(
+  tibble(
+    Model = c("Naive", "Dense", "LSTM", "GRU", "Stacked GRU", "Conv1D+GRU"),
+    MAE = c(naive_mae, dense_mae, lstm_mae, gru_mae, stacked_mae, conv_mae)
+  ),
+  gru_unit_results,
+  conv_gru_unit_results
+) %>%
+  arrange(MAE)
+
+results
+```
+
+```{r}
+results %>%
+  ggplot(aes(x = reorder(Model, MAE), y = MAE)) +
+  geom_col() +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Validation MAE by Model and Unit Size",
+    x = "Model",
+    y = "Validation MAE"
+  )
+```
+
+```{r}
+best_model_name <- results$Model[1]
+cat("Best model:", best_model_name, "\n")
+
+get_units <- function(name) {
+  m <- regmatches(name, regexpr("[0-9]+(?= units)", name, perl = TRUE))
+  if (length(m) == 1) as.integer(m) else 32L
+}
+
+best_model <- if (best_model_name == "Dense") {
+  dense_model
+} else if (best_model_name == "LSTM") {
+  lstm_model
+} else if (best_model_name == "GRU") {
+  gru_model
+} else if (best_model_name == "Stacked GRU") {
+  stacked_gru
+} else if (best_model_name == "Conv1D+GRU") {
+  conv_gru
+} else if (grepl("^GRU \\(", best_model_name)) {
+  u <- get_units(best_model_name)
+  m <- keras_model_sequential() %>%
+    layer_gru(units = u, recurrent_dropout = 0.25,
+              input_shape = c(sequence_length, ncol(train_matrix))) %>%
+    layer_dense(units = 1)
+  m %>% compile(optimizer = optimizer_rmsprop(), loss = "mse", metrics = list("mae"))
+  fit_model(m, train_ds, val_ds)
+  m
+} else if (grepl("^Conv1D\\+GRU \\(", best_model_name)) {
+  u <- get_units(best_model_name)
+  m <- keras_model_sequential() %>%
+    layer_conv_1d(filters = u, kernel_size = 5, activation = "relu",
+                  input_shape = c(sequence_length, ncol(train_matrix))) %>%
+    layer_max_pooling_1d(pool_size = 3) %>%
+    layer_gru(units = u) %>%
+    layer_dense(units = 1)
+  m %>% compile(optimizer = optimizer_rmsprop(), loss = "mse", metrics = list("mae"))
+  fit_model(m, train_ds, val_ds)
+  m
+} else {
+  NULL
+}
+
+if (!is.null(best_model)) {
+  cat("\nTest set evaluation for:", best_model_name, "\n")
+  test_metrics <- best_model %>% evaluate(test_ds, verbose = 0)
+  print(test_metrics)
+} else {
+  cat("Naive baseline was best on validation; no neural network test evaluation run.\n")
+}
+```
