@@ -1,0 +1,526 @@
+---
+title: "Assignment 4: Text and Sequence Data"
+author: "Curtis Meister"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache = TRUE
+)
+```
+
+```{r}
+library(keras)
+library(tensorflow)
+library(tfdatasets)
+library(reticulate)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(rappdirs)
+```
+
+```{r seeds}
+set.seed(123)
+tf$random$set_seed(as.integer(123))
+```
+
+Per the instructions I have made the following adjustments:
+
+```{r hyperparameters}
+max_words  <- 10000
+max_length <- 150
+train_n    <- 100
+val_n      <- 10000
+batch_size <- 32
+embed_dim  <- 100
+lstm_units <- 32
+epochs_main <- 15
+```
+
+```{r load_data}
+imdb <- dataset_imdb(num_words = max_words)
+
+c(c(train_data, train_labels), c(test_data, test_labels)) %<-% imdb
+
+cat("Original training sequences:", length(train_data), "\n")
+cat("Original test sequences    :", length(test_data), "\n")
+```
+
+```{r decode_reviews}
+word_index <- dataset_imdb_word_index()
+reverse_word_index <- names(word_index)
+names(reverse_word_index) <- word_index
+
+decode_review <- function(review) {
+  tokens <- sapply(review, function(i) {
+    key <- as.character(i - 3)
+    if (key %in% names(reverse_word_index)) {
+      reverse_word_index[[key]]
+    } else {
+      "[UNK]"
+    }
+  })
+  paste(tokens, collapse = " ")
+}
+
+train_text_150 <- map_chr(train_data, ~ decode_review(head(.x, max_length)))
+test_text_150  <- map_chr(test_data,  ~ decode_review(head(.x, max_length)))
+```
+
+The first 100 training samples are used for model fitting. The next 10,000 samples are for validation.
+
+```{r split_data}
+x_train_text <- train_text_150[1:train_n]
+y_train <- train_labels[1:train_n]
+
+x_val_text <- train_text_150[(train_n + 1):(train_n + val_n)]
+y_val <- train_labels[(train_n + 1):(train_n + val_n)]
+
+x_test_text <- test_text_150
+y_test <- test_labels
+
+cat("Training samples  :", length(x_train_text), "\n")
+cat("Validation samples:", length(x_val_text), "\n")
+cat("Test samples      :", length(x_test_text), "\n")
+```
+
+```{r vectorization}
+text_vectorization <- layer_text_vectorization(
+  max_tokens = max_words,
+  output_mode = "int",
+  output_sequence_length = max_length
+)
+
+text_vectorization %>% adapt(x_train_text)
+
+train_sequences <- text_vectorization(x_train_text)
+val_sequences   <- text_vectorization(x_val_text)
+test_sequences  <- text_vectorization(x_test_text)
+
+vocab <- get_vocabulary(text_vectorization)
+word_index_tv <- setNames(seq_along(vocab) - 1L, vocab)
+
+cat("Vocabulary size from TextVectorization:", length(vocab), "\n")
+```
+
+```{r tf_datasets}
+train_ds <- tensor_slices_dataset(list(train_sequences, y_train)) %>%
+  dataset_batch(batch_size)
+
+val_ds <- tensor_slices_dataset(list(val_sequences, y_val)) %>%
+  dataset_batch(batch_size)
+
+test_ds <- tensor_slices_dataset(list(test_sequences, y_test)) %>%
+  dataset_batch(batch_size)
+```
+
+```{r learned_model_fn}
+build_learned_model <- function(max_words = 10000,
+                                embed_dim = 100,
+                                lstm_units = 32,
+                                dropout_rate = 0.5) {
+
+  inputs <- layer_input(shape = c(max_length), dtype = "int64")
+
+  outputs <- inputs %>%
+    layer_embedding(
+      input_dim = max_words,
+      output_dim = embed_dim,
+      mask_zero = TRUE
+    ) %>%
+    bidirectional(layer_lstm(units = lstm_units)) %>%
+    layer_dropout(rate = dropout_rate) %>%
+    layer_dense(units = 1, activation = "sigmoid")
+
+  keras_model(inputs = inputs, outputs = outputs) %>%
+    compile(
+      optimizer = "rmsprop",
+      loss = "binary_crossentropy",
+      metrics = "accuracy"
+    )
+}
+```
+
+```{r train_learned_model, cache=TRUE}
+learned_model <- build_learned_model(
+  max_words = max_words,
+  embed_dim = embed_dim,
+  lstm_units = lstm_units
+)
+
+summary(learned_model)
+
+history_learned <- learned_model %>% fit(
+  train_ds,
+  validation_data = val_ds,
+  epochs = epochs_main,
+  callbacks = list(
+    callback_early_stopping(
+      monitor = "val_accuracy",
+      patience = 3,
+      restore_best_weights = TRUE
+    )
+  ),
+  verbose = 2
+)
+
+learned_eval <- learned_model %>% evaluate(test_ds, verbose = 0)
+learned_eval
+```
+
+```{r download_glove}
+options(timeout = max(1200, getOption("timeout")))
+
+glove_dir  <- file.path(path.expand("~"), "glove")
+dir.create(glove_dir, recursive = TRUE, showWarnings = FALSE)
+
+zip_path  <- file.path(glove_dir, "glove.6B.zip")
+glove_txt <- file.path(glove_dir, "glove.6B.100d.txt")
+
+if (!file.exists(glove_txt)) {
+  zip_ok <- FALSE
+
+  if (file.exists(zip_path)) {
+    zip_ok <- tryCatch({
+      tmp <- utils::unzip(zip_path, list = TRUE)
+      any(grepl("glove.6B.100d.txt", tmp$Name))
+    }, error = function(e) FALSE)
+  }
+
+  if (!zip_ok) {
+    if (file.exists(zip_path)) {
+      cat("Existing zip is invalid. Removing partial/corrupt file...\n")
+      file.remove(zip_path)
+    }
+
+    cat("Downloading GloVe zip to:", zip_path, "\n")
+    download.file(
+      url = "https://downloads.cs.stanford.edu/nlp/data/glove.6B.zip",
+      destfile = zip_path,
+      mode = "wb",
+      method = "libcurl"
+    )
+  }
+
+  cat("Extracting glove.6B.100d.txt from zip...\n")
+  utils::unzip(zip_path, files = "glove.6B.100d.txt", exdir = glove_dir)
+}
+
+cat("glove_dir exists :", dir.exists(glove_dir), "\n")
+cat("zip exists       :", file.exists(zip_path), "\n")
+cat("txt exists       :", file.exists(glove_txt), "\n")
+cat("Files in glove_dir:\n")
+print(list.files(glove_dir))
+```
+
+```{r parse_glove}
+use_pretrained_glove <- file.exists(glove_txt)
+
+if (use_pretrained_glove) {
+  cat("Using GloVe file:", glove_txt, "\n")
+} else {
+  cat("GloVe file was not found - continuing with fallback random matrix.\n")
+}
+
+embeddings_index <- new.env(hash = TRUE, parent = emptyenv())
+
+if (use_pretrained_glove) {
+  con <- file(glove_txt, open = "r")
+  while (length(line <- readLines(con, n = 1, warn = FALSE)) > 0) {
+    values <- strsplit(line, " ")[[1]]
+    word   <- values[1]
+    coefs  <- as.numeric(values[-1])
+    embeddings_index[[word]] <- coefs
+  }
+  close(con)
+  cat("Loaded", length(ls(embeddings_index)), "GloVe word vectors\n")
+} else {
+  cat("Loaded 0 GloVe word vectors\n")
+}
+```
+
+```{r build_embedding_matrix}
+if (use_pretrained_glove) {
+  embedding_matrix <- matrix(0, nrow = max_words, ncol = embed_dim)
+
+  # fill the matrix with GloVe vectors when the word is found
+  for (word in vocab) {
+    idx <- unname(word_index_tv[word])
+
+    if (length(idx) == 1 && !is.na(idx) && idx > 0 && idx < max_words) {
+      vec <- embeddings_index[[word]]
+
+      if (!is.null(vec) && length(vec) == embed_dim) {
+        embedding_matrix[idx + 1, ] <- vec
+      }
+    }
+  }
+
+  coverage <- sum(rowSums(abs(embedding_matrix)) > 0)
+  cat("Words covered by GloVe:", coverage, "\n")
+} else {
+  set.seed(123)
+  embedding_matrix <- matrix(
+    rnorm(max_words * embed_dim, mean = 0, sd = 0.02),
+    nrow = max_words,
+    ncol = embed_dim
+  )
+  embedding_matrix[1, ] <- 0
+  coverage <- 0
+  cat("Using fallback random embedding matrix because GloVe was unavailable.\n")
+}
+```
+
+```{r pretrained_model_fn}
+build_pretrained_model <- function(embedding_matrix,
+                                   max_words = 10000,
+                                   embed_dim = 100,
+                                   lstm_units = 32,
+                                   dropout_rate = 0.5) {
+
+  inputs <- layer_input(shape = c(max_length), dtype = "int64")
+
+  outputs <- inputs %>%
+    layer_embedding(
+      input_dim = max_words,
+      output_dim = embed_dim,
+      weights = list(embedding_matrix),
+      trainable = FALSE,
+      mask_zero = TRUE
+    ) %>%
+    bidirectional(layer_lstm(units = lstm_units)) %>%
+    layer_dropout(rate = dropout_rate) %>%
+    layer_dense(units = 1, activation = "sigmoid")
+
+  keras_model(inputs = inputs, outputs = outputs) %>%
+    compile(
+      optimizer = "rmsprop",
+      loss = "binary_crossentropy",
+      metrics = "accuracy"
+    )
+}
+```
+
+```{r train_pretrained_model, cache=TRUE}
+pretrained_model <- build_pretrained_model(
+  embedding_matrix = embedding_matrix,
+  max_words = max_words,
+  embed_dim = embed_dim,
+  lstm_units = lstm_units
+)
+
+summary(pretrained_model)
+
+history_pretrained <- pretrained_model %>% fit(
+  train_ds,
+  validation_data = val_ds,
+  epochs = epochs_main,
+  callbacks = list(
+    callback_early_stopping(
+      monitor = "val_accuracy",
+      patience = 3,
+      restore_best_weights = TRUE
+    )
+  ),
+  verbose = 2
+)
+
+pretrained_eval <- pretrained_model %>% evaluate(test_ds, verbose = 0)
+pretrained_eval
+```
+
+Results at 100 Training Samples
+
+```{r comparison_table}
+comparison <- tibble(
+  Model = c("Learned Embedding", "Pretrained GloVe"),
+  Test_Accuracy = c(as.numeric(learned_eval[["accuracy"]]),
+                    as.numeric(pretrained_eval[["accuracy"]])),
+  Test_Loss = c(as.numeric(learned_eval[["loss"]]),
+                as.numeric(pretrained_eval[["loss"]]))
+)
+
+knitr::kable(
+  comparison,
+  col.names = c("Model", "Test Accuracy", "Test Loss"),
+  digits = 4,
+  caption = "Results (100 Samples)"
+)
+```
+
+```{r crossover_experiment, cache=TRUE}
+training_sizes <- c(100, 200, 500, 1000, 2000)
+results <- tibble()
+
+for (n_train in training_sizes) {
+
+  x_tr_n <- train_text_150[1:n_train]
+  y_tr_n <- train_labels[1:n_train]
+
+  tv_n <- layer_text_vectorization(
+    max_tokens = max_words,
+    output_mode = "int",
+    output_sequence_length = max_length
+  )
+
+  tv_n %>% adapt(x_tr_n)
+
+  tr_seq_n  <- tv_n(x_tr_n)
+  val_seq_n <- tv_n(x_val_text)
+  te_seq_n  <- tv_n(x_test_text)
+
+  vocab_n <- get_vocabulary(tv_n)
+  word_idx_n <- setNames(seq_along(vocab_n) - 1L, vocab_n)
+
+  tr_ds_n <- tensor_slices_dataset(list(tr_seq_n, y_tr_n)) %>%
+    dataset_batch(batch_size)
+  val_ds_n <- tensor_slices_dataset(list(val_seq_n, y_val)) %>%
+    dataset_batch(batch_size)
+  te_ds_n <- tensor_slices_dataset(list(te_seq_n, y_test)) %>%
+    dataset_batch(batch_size)
+
+  early_stop <- list(
+    callback_early_stopping(
+      monitor = "val_accuracy",
+      patience = 2,
+      restore_best_weights = TRUE
+    )
+  )
+
+  model_learned_n <- build_learned_model(
+    max_words = max_words,
+    embed_dim = embed_dim,
+    lstm_units = lstm_units
+  )
+
+  model_learned_n %>% fit(
+    tr_ds_n,
+    validation_data = val_ds_n,
+    epochs = 10,
+    callbacks = early_stop,
+    verbose = 0
+  )
+
+  learned_metrics_n <- model_learned_n %>% evaluate(te_ds_n, verbose = 0)
+
+  if (use_pretrained_glove) {
+    embedding_matrix_n <- matrix(0, nrow = max_words, ncol = embed_dim)
+
+    for (word in vocab_n) {
+      idx <- unname(word_idx_n[word])
+
+      if (length(idx) == 1 && !is.na(idx) && idx > 0 && idx < max_words) {
+        vec <- embeddings_index[[word]]
+        if (!is.null(vec) && length(vec) == embed_dim) {
+          embedding_matrix_n[idx + 1, ] <- vec
+        }
+      }
+    }
+  } else {
+    set.seed(123)
+    embedding_matrix_n <- matrix(
+      rnorm(max_words * embed_dim, mean = 0, sd = 0.02),
+      nrow = max_words,
+      ncol = embed_dim
+    )
+    embedding_matrix_n[1, ] <- 0
+  }
+
+  model_pretrained_n <- build_pretrained_model(
+    embedding_matrix = embedding_matrix_n,
+    max_words = max_words,
+    embed_dim = embed_dim,
+    lstm_units = lstm_units
+  )
+
+  model_pretrained_n %>% fit(
+    tr_ds_n,
+    validation_data = val_ds_n,
+    epochs = 10,
+    callbacks = early_stop,
+    verbose = 0
+  )
+
+  pretrained_metrics_n <- model_pretrained_n %>% evaluate(te_ds_n, verbose = 0)
+
+  results <- bind_rows(
+    results,
+    tibble(
+      training_size = n_train,
+      model = "Learned Embedding",
+      test_loss = as.numeric(learned_metrics_n[["loss"]]),
+      test_accuracy = as.numeric(learned_metrics_n[["accuracy"]])
+    ),
+    tibble(
+      training_size = n_train,
+      model = "Pretrained GloVe",
+      test_loss = as.numeric(pretrained_metrics_n[["loss"]]),
+      test_accuracy = as.numeric(pretrained_metrics_n[["accuracy"]])
+    )
+  )
+}
+```
+
+```{r crossover_table}
+results_wide <- results %>%
+  select(training_size, model, test_accuracy) %>%
+  pivot_wider(names_from = model, values_from = test_accuracy)
+
+knitr::kable(
+  results_wide,
+  col.names = c("Training Samples", "Learned Embedding", "Pretrained GloVe"),
+  digits = 4,
+  caption = "Accuracy vs. Training Size"
+)
+```
+
+```{r crossover_plot, fig.width=7, fig.height=4.5}
+ggplot(results, aes(x = training_size, y = test_accuracy, color = model,
+                    linetype = model, group = model)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 3) +
+  scale_x_log10(breaks = training_sizes, labels = training_sizes) +
+  scale_y_continuous(limits = c(0.5, 1.0)) +
+  labs(
+    title = "Accuracy vs. Training Sample Size",
+    subtitle = "Learned vs. Pretrained GloVe",
+    x = "Training samples (log scale)",
+    y = "Test accuracy",
+    color = NULL,
+    linetype = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+```{r crossover_point}
+crossover_row <- results %>%
+  select(training_size, model, test_accuracy) %>%
+  pivot_wider(names_from = model, values_from = test_accuracy) %>%
+  filter(`Learned Embedding` >= `Pretrained GloVe`) %>%
+  arrange(training_size) %>%
+  slice(1)
+
+crossover_n <- if (nrow(crossover_row) > 0) {
+  as.character(crossover_row$training_size)
+} else {
+  paste0("> ", max(training_sizes))
+}
+
+crossover_n
+```
